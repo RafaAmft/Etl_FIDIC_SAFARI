@@ -174,17 +174,21 @@ def create_fund_search(
     if 'CNPJ_FUNDO' not in df.columns:
         return None
     
-    cnpjs = sorted(df['CNPJ_FUNDO'].dropna().unique().tolist())
+    # Garantir que CNPJs são strings (evita erro de tipo no cloud)
+    cnpjs = df['CNPJ_FUNDO'].dropna().astype(str).unique().tolist()
+    cnpjs = sorted([str(c) for c in cnpjs])
     
     if not cnpjs:
         return None
     
+    options = [''] + cnpjs
+    
     selected = st.selectbox(
         label,
-        options=[''] + cnpjs,
+        options=options,
         index=0,
         key=key,
-        format_func=lambda x: "Selecione um fundo..." if x == '' else x
+        format_func=lambda x: "Selecione um fundo..." if x == '' else str(x)
     )
     
     return selected if selected else None
