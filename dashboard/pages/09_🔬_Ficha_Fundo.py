@@ -81,7 +81,10 @@ try:
     # DADOS DO FUNDO SELECIONADO
     # ═══════════════════════════════════════════════════════════════════════
     
-    df_fund = df_success[df_success['CNPJ_FUNDO'] == selected_cnpj].sort_values('DATA_COMPETENCIA')
+    # Garantir que CNPJ é string para comparação correta
+    df_success['CNPJ_FUNDO'] = df_success['CNPJ_FUNDO'].astype(str)
+    
+    df_fund = df_success[df_success['CNPJ_FUNDO'] == str(selected_cnpj)].sort_values('DATA_COMPETENCIA')
     
     if df_fund.empty:
         st.error(f"❌ Nenhum dado encontrado para o CNPJ: {selected_cnpj}")
@@ -89,7 +92,7 @@ try:
     
     # Último registro
     latest = df_fund.iloc[-1]
-    metrics = calculate_fund_metrics(df_success, selected_cnpj)
+    metrics = calculate_fund_metrics(df_success, str(selected_cnpj))
     
     st.markdown("---")
     
