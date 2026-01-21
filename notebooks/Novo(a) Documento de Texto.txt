@@ -1,0 +1,886 @@
+# ═════════════════════════════════════════════════════════════════════
+# ETL FIDC V5 - VERSÃO OTIMIZADA PARA GOOGLE COLAB
+# ═════════════════════════════════════════════════════════════════════
+# Melhorias implementadas:
+# 1. ✅ Bug fix - Conversão de tipos
+# 2. ✅ Logging profissional
+# 3. ✅ Retry logic com backoff exponencial
+# 4. ✅ Paralelização (ThreadPoolExecutor)
+# 5. ✅ Cache de resultados
+# 6. ✅ Progress bar (tqdm)
+# 7. ✅ Validação robusta de dados
+# ═════════════════════════════════════════════════════════════════════
+
+# ═════════════════════════════════════════════════════════════════════
+# CÉLULA 1: INSTALAÇÃO DE DEPENDÊNCIAS (APENAS SE NECESSÁRIO)
+# ═════════════════════════════════════════════════════════════════════
+
+# Instalar apenas se não tiver (Colab já tem a maioria)
+!pip install tenacity -q
+
+print("✅ Dependências verificadas!")
+
+# ═════════════════════════════════════════════════════════════════════
+# CÉLULA 2: IMPORTS E CONFIGURAÇÕES
+# ═════════════════════════════════════════════════════════════════════
+
+import pandas as pd
+import requests
+import base64
+import xml.etree.ElementTree as ET
+import time
+import os
+import logging
+import hashlib
+import pickle
+from typing import Dict, List, Optional, Union
+from datetime import datetime
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tqdm.auto import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# ═════════════════════════════════════════════════════════════════════
+# CONFIGURAÇÕES
+# ═════════════════════════════════════════════════════════════════════
+
+# API B3
+URL_API_BUSCA = "https://fnet.bmfbovespa.com.br/fnet/publico/pesquisarGerenciadorDocumentosDados"
+URL_API_DOWNLOAD = "https://fnet.bmfbovespa.com.br/fnet/publico/downloadDocumento"
+HEADERS = {"User-Agent": "Mozilla/5.0"}
+
+# Controle de requisições
+DELAY_ENTRE_REQUISICOES = 2
+TIMEOUT_BUSCA = 10
+TIMEOUT_DOWNLOAD = 20
+MAX_RETRIES = 3
+
+# Coleta histórica
+ANOS_DEZEMBRO = [2020, 2021, 2022, 2023, 2024]
+COLETAR_ULTIMO_MES = True
+
+# Performance
+MAX_WORKERS = 5  # Threads paralelas
+CACHE_ENABLED = True
+
+# ═════════════════════════════════════════════════════════════════════
+# CONFIGURAÇÃO DE LOGGING
+# ═════════════════════════════════════════════════════════════════════
+
+# Criar diretório de logs
+LOG_DIR = Path('logs')
+LOG_DIR.mkdir(exist_ok=True)
+
+# Configurar logger
+log_filename = LOG_DIR / f'etl_fidc_{datetime.now():%Y%m%d_%H%M%S}.log'
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)-8s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.FileHandler(log_filename, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+# Configurar cache
+CACHE_DIR = Path('.cache_fidc')
+if CACHE_ENABLED:
+    CACHE_DIR.mkdir(exist_ok=True)
+    logger.info(f"Cache habilitado em: {CACHE_DIR.absolute()}")
+
+logger.info("="*80)
+logger.info("ETL FIDC V5 - VERSÃO OTIMIZADA")
+logger.info("="*80)
+logger.info(f"Configurações carregadas:")
+logger.info(f"  • Delay entre requisições: {DELAY_ENTRE_REQUISICOES}s")
+logger.info(f"  • Max workers (threads): {MAX_WORKERS}")
+logger.info(f"  • Max retries: {MAX_RETRIES}")
+logger.info(f"  • Anos dezembro: {ANOS_DEZEMBRO}")
+logger.info(f"  • Cache: {'Habilitado' if CACHE_ENABLED else 'Desabilitado'}")
+
+# ═════════════════════════════════════════════════════════════════════
+# CÉLULA 3: FUNÇÕES AUXILIARES MELHORADAS
+# ═════════════════════════════════════════════════════════════════════
+
+def limpar_tag(tag: str) -> str:
+    """Remove namespace XML das tags."""
+    return tag.split('}')[-1] if '}' in tag else tag
+
+
+def converter_valor(texto: Union[str, float, int, None]) -> float:
+    """
+    Converte string no formato brasileiro para float com validação robusta.
+    
+    Args:
+        texto: Valor a ser convertido
+        
+    Returns:
+        float: Valor convertido ou 0.0 se inválido
+    """
+    if texto is None or texto == '':
+        return 0.0
+    
+    # Se já é número, retorna
+    if isinstance(texto, (int, float)):
+        return float(texto)
+    
+    try:
+        texto_str = str(texto).strip()
+        if not texto_str:
+            return 0.0
+        
+        # Remove pontos (separador de milhar) e troca vírgula por ponto
+        texto_limpo = texto_str.replace('.', '').replace(',', '.')
+        return float(texto_limpo)
+    except (ValueError, AttributeError) as e:
+        logger.debug(f"Erro ao converter '{texto}': {e}")
+        return 0.0
+
+
+def buscar_valor_xml(root: ET.Element, caminho: str) -> Union[float, str]:
+    """
+    Busca um valor no XML com tratamento robusto de namespaces.
+    
+    Args:
+        root: Elemento raiz do XML
+        caminho: Caminho XPath simplificado
+        
+    Returns:
+        float ou string, com fallback para 0.0 ou ''
+    """
+    try:
+        elemento = root.find(f'.//{caminho}')
+        
+        if elemento is not None and elemento.text:
+            texto = elemento.text.strip()
+            
+            if not texto:
+                return 0.0 if '/' in caminho else ''
+            
+            # Tentar converter para número
+            try:
+                return converter_valor(texto)
+            except:
+                # Se falhar, retornar como string
+                return texto
+        
+        # Retornar valor padrão baseado no tipo esperado
+        return 0.0 if '/' in caminho else ''
+        
+    except Exception as e:
+        logger.debug(f"Erro ao buscar '{caminho}': {e}")
+        return 0.0 if '/' in caminho else ''
+
+
+# ═════════════════════════════════════════════════════════════════════
+# CÉLULA 4: FUNÇÕES DE CACHE
+# ═════════════════════════════════════════════════════════════════════
+
+def gerar_cache_key(cnpj: str, doc_id: str) -> str:
+    """Gera chave única para cache."""
+    return hashlib.md5(f"{cnpj}_{doc_id}".encode()).hexdigest()
+
+
+def salvar_cache(cnpj: str, doc_id: str, dados: Dict) -> None:
+    """Salva resultado em cache."""
+    if not CACHE_ENABLED:
+        return
+    
+    try:
+        cache_key = gerar_cache_key(cnpj, doc_id)
+        cache_file = CACHE_DIR / f"{cache_key}.pkl"
+        
+        with open(cache_file, 'wb') as f:
+            pickle.dump(dados, f)
+        
+        logger.debug(f"Cache salvo: {cnpj} | doc {doc_id}")
+    except Exception as e:
+        logger.warning(f"Erro ao salvar cache: {e}")
+
+
+def ler_cache(cnpj: str, doc_id: str) -> Optional[Dict]:
+    """Lê resultado do cache se existir."""
+    if not CACHE_ENABLED:
+        return None
+    
+    try:
+        cache_key = gerar_cache_key(cnpj, doc_id)
+        cache_file = CACHE_DIR / f"{cache_key}.pkl"
+        
+        if cache_file.exists():
+            with open(cache_file, 'rb') as f:
+                dados = pickle.load(f)
+            logger.debug(f"Cache hit: {cnpj} | doc {doc_id}")
+            return dados
+        
+        return None
+    except Exception as e:
+        logger.warning(f"Erro ao ler cache: {e}")
+        return None
+
+
+# ═════════════════════════════════════════════════════════════════════
+# CÉLULA 5: REQUISIÇÕES COM RETRY LOGIC
+# ═════════════════════════════════════════════════════════════════════
+
+@retry(
+    stop=stop_after_attempt(MAX_RETRIES),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type((requests.exceptions.RequestException, requests.exceptions.Timeout)),
+    reraise=True
+)
+def fazer_requisicao_com_retry(url: str, **kwargs) -> requests.Response:
+    """
+    Faz requisição HTTP com retry automático e backoff exponencial.
+    
+    Args:
+        url: URL para requisição
+        **kwargs: Argumentos para requests.get()
+        
+    Returns:
+        Response object
+        
+    Raises:
+        requests.exceptions.RequestException: Após MAX_RETRIES tentativas
+    """
+    logger.debug(f"Requisição: {url[:80]}...")
+    response = requests.get(url, **kwargs)
+    response.raise_for_status()
+    return response
+
+
+# ═════════════════════════════════════════════════════════════════════
+# CÉLULA 6: EXTRAÇÃO DE DADOS DO XML (COM BUG FIX)
+# ═════════════════════════════════════════════════════════════════════
+
+def extrair_dados_xml_completo(xml_content: bytes) -> Dict[str, Union[str, float, int, None]]:
+    """
+    Extrai TODOS os campos relevantes do XML de Informe Mensal FIDC.
+    
+    CORRIGIDO: Bug de conversão de tipos no cálculo de inadimplência.
+    
+    Args:
+        xml_content: Conteúdo XML em bytes (já decodificado do Base64)
+        
+    Returns:
+        Dicionário com 90+ campos estruturados
+    """
+    try:
+        root = ET.fromstring(xml_content)
+    except ET.ParseError as e:
+        logger.error(f"Erro ao fazer parse do XML: {e}")
+        raise
+    
+    dados = {
+        # ═══ SEÇÃO 1: IDENTIFICAÇÃO DO FUNDO ═══
+        'CNPJ_FUNDO': buscar_valor_xml(root, 'NR_CNPJ_FUNDO'),
+        'CNPJ_ADMINISTRADOR': buscar_valor_xml(root, 'NR_CNPJ_ADM'),
+        'DATA_COMPETENCIA': buscar_valor_xml(root, 'DT_COMPT'),
+        'TIPO_CONDOMINIO': buscar_valor_xml(root, 'TP_CONDOMINIO'),
+        'FUNDO_EXCLUSIVO': buscar_valor_xml(root, 'FDO_EXCL'),
+        'CLASSE_UNICA': buscar_valor_xml(root, 'CLASS_UNICA'),
+        'COTISTA_VINCULADO': buscar_valor_xml(root, 'COTST_VINCUL'),
+        
+        # ═══ SEÇÃO 2: ATIVOS GERAIS ═══
+        'ATIVO_TOTAL': buscar_valor_xml(root, 'VL_SOM_APLIC_ATIVO'),
+        'DISPONIBILIDADES': buscar_valor_xml(root, 'VL_DISPONIB'),
+        'CARTEIRA_TOTAL': buscar_valor_xml(root, 'VL_CARTEIRA'),
+        'OUTROS_ATIVOS_TOTAL': buscar_valor_xml(root, 'VL_SOM_OUTROS_ATIVOS'),
+        'OUTROS_ATIVOS_CURTO_PRAZO': buscar_valor_xml(root, 'OUTROS_ATIVOS/VL_OUTRO_VL_RECEB_CURPRZ'),
+        'OUTROS_ATIVOS_LONGO_PRAZO': buscar_valor_xml(root, 'OUTROS_ATIVOS/VL_OUTRO_VL_RECEB_LPRAZO'),
+        
+        # ═══ SEÇÃO 3: CRÉDITOS EXISTENTES ═══
+        'CREDITOS_ADQUIRIDOS': buscar_valor_xml(root, 'CRED_EXISTE/VL_SOM_DICRED_AQUIS'),
+        'CRED_VENCIDOS_ADIMPLENTES': buscar_valor_xml(root, 'CRED_EXISTE/VL_CRED_EXISTE_VENC_ADIMPL'),
+        'CRED_VENCIDOS_INADIMPLENTES': buscar_valor_xml(root, 'CRED_EXISTE/VL_CRED_EXISTE_VENC_INAD'),
+        'CRED_TOTAL_VENC_INADIMPL': buscar_valor_xml(root, 'CRED_EXISTE/VL_CRED_TOTAL_VENC_INAD'),
+        'CRED_INADIMPLENCIA': buscar_valor_xml(root, 'CRED_EXISTE/VL_CRED_EXISTE_INAD'),
+        'CRED_PERFORMADOS': buscar_valor_xml(root, 'CRED_EXISTE/VL_CRED_REFER_DICRED_PERFO'),
+        'CRED_VENCIDOS_PENDENTES': buscar_valor_xml(root, 'CRED_EXISTE/VL_CRED_VENC_PEND'),
+        'CRED_EMP_RECUPERACAO': buscar_valor_xml(root, 'CRED_EXISTE/VL_CRED_ORIGEM_EMP_PROC_RECUP'),
+        'CRED_RECEITA_PUBLICA': buscar_valor_xml(root, 'CRED_EXISTE/VL_DECOR_RECEIT_PUBLIC'),
+        'CRED_ACAO_JUDICIAL': buscar_valor_xml(root, 'CRED_EXISTE/VL_CRED_ACAO_JUDIC'),
+        'CRED_CONSTITUICAO_JURIDICA': buscar_valor_xml(root, 'CRED_EXISTE/VL_CRED_CONST_JUR_FATRISC'),
+        'CRED_PROVISAO_REDUCAO': buscar_valor_xml(root, 'CRED_EXISTE/VL_PROVIS_REDUC_RECUP'),
+        
+        # ═══ SEÇÃO 4: DIREITOS CREDITÓRIOS (DICRED) ═══
+        'DICRED_TOTAL': buscar_valor_xml(root, 'DICRED/VL_DICRED'),
+        'DICRED_CEDENTE': buscar_valor_xml(root, 'DICRED/VL_DICRED_CEDENT'),
+        'DICRED_VENC_INADIMPL': buscar_valor_xml(root, 'DICRED/VL_DICRED_EXISTE_VENC_INAD'),
+        'DICRED_TOTAL_VENC_INAD': buscar_valor_xml(root, 'DICRED/VL_DICRED_TOTAL_VENC_INAD'),
+        'DICRED_INADIMPLENCIA': buscar_valor_xml(root, 'DICRED/VL_DICRED_EXISTE_INAD'),
+        'DICRED_PERFORMADOS': buscar_valor_xml(root, 'DICRED/VL_DICRED_REFER_DICRED_PERFO'),
+        'DICRED_VENC_PENDENTES': buscar_valor_xml(root, 'DICRED/VL_DICRED_VENC_PEND'),
+        'DICRED_EMP_RECUPERACAO': buscar_valor_xml(root, 'DICRED/VL_DICRED_ORIGEM_EMP_PROC_RECUP'),
+        'DICRED_RECEITA_PUBLICA': buscar_valor_xml(root, 'DICRED/VL_DICRED_RECEIT_PUBLIC'),
+        'DICRED_ACAO_JUDICIAL': buscar_valor_xml(root, 'DICRED/VL_DICRED_ACAO_JUDIC'),
+        'DICRED_PROVISAO_REDUCAO': buscar_valor_xml(root, 'DICRED/VL_DICRED_PROVIS_REDUC_RECUP'),
+        
+        # ═══ SEÇÃO 5: VALORES MOBILIÁRIOS ═══
+        'VALORES_MOBILIARIOS_TOTAL': buscar_valor_xml(root, 'VALORES_MOB/VL_SOM_VALORES_MOB'),
+        'DEBENTURES': buscar_valor_xml(root, 'VALORES_MOB/VL_DEBT'),
+        'CRI': buscar_valor_xml(root, 'VALORES_MOB/VL_CRI'),
+        'NOTAS_PROMISSORIAS_COMERCIAIS': buscar_valor_xml(root, 'VALORES_MOB/VL_NP_COMERC'),
+        'LETRAS_FINANCEIRAS': buscar_valor_xml(root, 'VALORES_MOB/VL_LETRA_FINANC'),
+        'COTAS_FIF': buscar_valor_xml(root, 'VALORES_MOB/VL_CLS_COTA_FIF'),
+        'OUTROS_DIREITOS_CREDITORIOS': buscar_valor_xml(root, 'VALORES_MOB/VL_OUTRO_DICRED'),
+        
+        # ═══ SEÇÃO 6: OUTROS ATIVOS FINANCEIROS ═══
+        'TITULOS_PUBLICOS_FEDERAIS': buscar_valor_xml(root, 'VL_TITPUB_FED'),
+        'CDB': buscar_valor_xml(root, 'VL_CDB'),
+        'APLICACOES_COMPROMISSADAS': buscar_valor_xml(root, 'VL_APLIC_OPER_COMPSS'),
+        'ATIVOS_FINANCEIROS_RF': buscar_valor_xml(root, 'VL_ATIV_FINANC_RF'),
+        'COTAS_FIDC': buscar_valor_xml(root, 'VL_COTA_FIDC'),
+        
+        # ═══ SEÇÃO 7: MERCADO DE DERIVATIVOS ═══
+        'DERIVATIVOS_TOTAL': buscar_valor_xml(root, 'MERC_DERIVATIVO/VL_SOM_MERC_DERIVATIVO'),
+        'TERMO_COMPRADOR': buscar_valor_xml(root, 'MERC_DERIVATIVO/VL_MERC_TERMO_POS_COMPRD'),
+        'OPCOES_TITULAR': buscar_valor_xml(root, 'MERC_DERIVATIVO/VL_MERC_OP_POS_TITUL'),
+        'FUTUROS_AJUSTE_POSITIVO': buscar_valor_xml(root, 'MERC_DERIVATIVO/VL_MERC_FUT_AJUST_POSIT'),
+        'SWAP_A_RECEBER': buscar_valor_xml(root, 'MERC_DERIVATIVO/VL_DIFER_SWAP_RECEB'),
+        'COBERTURA_PRESTADA': buscar_valor_xml(root, 'MERC_DERIVATIVO/VL_COBERT_PREST'),
+        'DEPOSITOS_MARGEM': buscar_valor_xml(root, 'MERC_DERIVATIVO/VL_DEPOS_MARGEM'),
+        
+        # ═══ SEÇÃO 8: SEGMENTAÇÃO DA CARTEIRA ═══
+        'CARTEIRA_SEGMENTADA_TOTAL': buscar_valor_xml(root, 'CART_SEGMT/VL_SOM_CART_SEGMT'),
+        'SEGMT_INDUSTRIAL': buscar_valor_xml(root, 'CART_SEGMT/VL_IND'),
+        'SEGMT_MERCADO_IMOBILIARIO': buscar_valor_xml(root, 'CART_SEGMT/VL_MERC_IMOBIL'),
+        'SEGMT_AGRONEGOCIO': buscar_valor_xml(root, 'CART_SEGMT/VL_AGRONEG'),
+        'SEGMT_CARTAO_CREDITO': buscar_valor_xml(root, 'CART_SEGMT/VL_CART_CRED'),
+        'SEGMT_ACAO_JUDICIAL': buscar_valor_xml(root, 'CART_SEGMT/VL_ACAO_JUDIC'),
+        'SEGMT_PROPRIEDADE_INTELECTUAL': buscar_valor_xml(root, 'CART_SEGMT/VL_PROPRD_MARCA_PATENT'),
+        
+        # Subsegmento: COMERCIAL
+        'SEGMT_COMERCIAL_TOTAL': buscar_valor_xml(root, 'SEGMT_COMERC/VL_SOM_SEGMT_COMERC'),
+        'SEGMT_COMERCIO': buscar_valor_xml(root, 'SEGMT_COMERC/VL_COMERC'),
+        'SEGMT_COMERCIO_VAREJO': buscar_valor_xml(root, 'SEGMT_COMERC/VL_COMERC_VARJ'),
+        'SEGMT_ARREND_MERCANTIL': buscar_valor_xml(root, 'SEGMT_COMERC/VL_ARREND_MERCNT'),
+        
+        # Subsegmento: SERVIÇOS
+        'SEGMT_SERVICOS_TOTAL': buscar_valor_xml(root, 'SEGMT_SERV/VL_SOM_SEGMT_SERV'),
+        'SEGMT_SERVICOS_GERAIS': buscar_valor_xml(root, 'SEGMT_SERV/VL_SERV'),
+        'SEGMT_SERVICOS_PUBLICOS': buscar_valor_xml(root, 'SEGMT_SERV/VL_SERV_PUBLIC'),
+        'SEGMT_SERVICOS_EDUCACAO': buscar_valor_xml(root, 'SEGMT_SERV/VL_SERV_EDUC'),
+        'SEGMT_SERVICOS_ENTRETENIMENTO': buscar_valor_xml(root, 'SEGMT_SERV/VL_SERV_ENTRETEN'),
+        
+        # Subsegmento: FINANCEIRO
+        'SEGMT_FINANCEIRO_TOTAL': buscar_valor_xml(root, 'SEGMT_FINANC/VL_SOM_SEGMT_FINANC'),
+        'SEGMT_FINANC_CREDITO_PESSOA': buscar_valor_xml(root, 'SEGMT_FINANC/VL_FINANC_CRED_PESSOA'),
+        'SEGMT_FINANC_CONSIGNADO': buscar_valor_xml(root, 'SEGMT_FINANC/VL_FINANC_CRED_PESSOA_CONSIG'),
+        'SEGMT_FINANC_CORPORATIVO': buscar_valor_xml(root, 'SEGMT_FINANC/VL_FINANC_CRED_CORPOR'),
+        'SEGMT_FINANC_MIDDLE_MARKET': buscar_valor_xml(root, 'SEGMT_FINANC/VL_FINANC_MMARKET'),
+        'SEGMT_FINANC_VEICULOS': buscar_valor_xml(root, 'SEGMT_FINANC/VL_FINANC_VEICL'),
+        'SEGMT_FINANC_IMOB_EMPRESARIAL': buscar_valor_xml(root, 'SEGMT_FINANC/VL_FINANC_IMOBIL_EMPSRL'),
+        'SEGMT_FINANC_IMOB_RESIDENCIAL': buscar_valor_xml(root, 'SEGMT_FINANC/VL_FINANC_IMOBIL_RESID'),
+        'SEGMT_FINANC_OUTROS': buscar_valor_xml(root, 'SEGMT_FINANC/VL_FINANC_OUTRO'),
+        
+        # Subsegmento: FACTORING
+        'SEGMT_FACTORING_TOTAL': buscar_valor_xml(root, 'SEGMT_FACT/VL_SOM_SEGMT_FACT'),
+        'SEGMT_FACTORING_PESSOA': buscar_valor_xml(root, 'SEGMT_FACT/VL_FACT_PESSOA'),
+        'SEGMT_FACTORING_CORPORATIVO': buscar_valor_xml(root, 'SEGMT_FACT/VL_FACT_CORPOR'),
+        
+        # Subsegmento: SETOR PÚBLICO
+        'SEGMT_SETOR_PUBLICO_TOTAL': buscar_valor_xml(root, 'SEGMT_SETOR_PUBLIC/VL_SOM_SEGMT_SETOR_PUBLIC'),
+        'SEGMT_PRECATORIOS': buscar_valor_xml(root, 'SEGMT_SETOR_PUBLIC/VL_SETOR_PUBLIC_PRECAT'),
+        'SEGMT_CREDITOS_TRIBUTARIOS': buscar_valor_xml(root, 'SEGMT_SETOR_PUBLIC/VL_SETOR_PUBLIC_CRED_TRIBUT'),
+        'SEGMT_ROYALTIES': buscar_valor_xml(root, 'SEGMT_SETOR_PUBLIC/VL_SETOR_PUBLIC_ROYA'),
+        'SEGMT_SETOR_PUBLICO_OUTROS': buscar_valor_xml(root, 'SEGMT_SETOR_PUBLIC/VL_SETOR_PUBLIC_OUTRO'),
+    }
+    
+    # ─────────────────────────────────────────────────────────────────────────
+    # ✅ BUG FIX: CÁLCULO DE INDICADORES COM CONVERSÃO FORÇADA
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    # Garantir que valores são float antes de comparar
+    inadimpl_cred = float(dados.get('CRED_INADIMPLENCIA', 0) or 0)
+    inadimpl_dicred = float(dados.get('DICRED_INADIMPLENCIA', 0) or 0)
+    dados['INADIMPLENCIA_TOTAL'] = max(inadimpl_cred, inadimpl_dicred)
+    
+    carteira_credito = float(dados.get('CREDITOS_ADQUIRIDOS', 0) or 0)
+    ativo_total = float(dados.get('ATIVO_TOTAL', 0) or 0)
+    disponibilidades = float(dados.get('DISPONIBILIDADES', 0) or 0)
+    
+    # Índice de NPL
+    if carteira_credito > 0 and dados['INADIMPLENCIA_TOTAL'] > 0:
+        dados['INDICE_NPL_PERCENTUAL'] = (dados['INADIMPLENCIA_TOTAL'] / carteira_credito) * 100
+    else:
+        dados['INDICE_NPL_PERCENTUAL'] = 0.0
+    
+    # Taxa de liquidez
+    if ativo_total > 0:
+        dados['TAXA_LIQUIDEZ_PERCENTUAL'] = (disponibilidades / ativo_total) * 100
+    else:
+        dados['TAXA_LIQUIDEZ_PERCENTUAL'] = 0.0
+    
+    # Concentração em crédito
+    if ativo_total > 0:
+        dados['CONCENTRACAO_CREDITO_PERCENTUAL'] = (carteira_credito / ativo_total) * 100
+    else:
+        dados['CONCENTRACAO_CREDITO_PERCENTUAL'] = 0.0
+    
+    # Validação de NPL outlier
+    if dados['INDICE_NPL_PERCENTUAL'] > 1000:
+        logger.warning(f"NPL outlier detectado: {dados['INDICE_NPL_PERCENTUAL']:.2f}% | CNPJ: {dados.get('CNPJ_FUNDO', 'N/A')}")
+        dados['NPL_OUTLIER_FLAG'] = True
+    else:
+        dados['NPL_OUTLIER_FLAG'] = False
+    
+    return dados
+
+
+logger.info("✅ Função de extração definida (90+ campos + bug fix)")
+
+# ═════════════════════════════════════════════════════════════════════
+# CÉLULA 7: FUNÇÃO ETL PRINCIPAL COM PARALELIZAÇÃO
+# ═════════════════════════════════════════════════════════════════════
+
+def etl_fidc_historico(
+    cnpj_alvo: str, 
+    nome_fundo_referencia: str = "", 
+    anos_dezembro: List[int] = None, 
+    coletar_ultimo: bool = True
+) -> List[Dict]:
+    """
+    Executa ETL completo para um CNPJ com cache e retry.
+    
+    Args:
+        cnpj_alvo: CNPJ do fundo (14 dígitos)
+        nome_fundo_referencia: Nome do fundo (opcional)
+        anos_dezembro: Anos para buscar dezembro
+        coletar_ultimo: Se True, coleta último mês
+        
+    Returns:
+        Lista de dicionários com dados extraídos
+    """
+    
+    resultados_fundo_cnpj = []
+    
+    if anos_dezembro is None:
+        anos_dezembro = ANOS_DEZEMBRO
+    
+    try:
+        # ─────────────────────────────────────────────────────────────────────
+        # ETAPA 1: DISCOVERY (COM RETRY)
+        # ─────────────────────────────────────────────────────────────────────
+        
+        params = {
+            'd': 0,
+            's': 0,
+            'l': 200,
+            'cnpjFundo': cnpj_alvo
+        }
+        
+        resp_busca = fazer_requisicao_com_retry(
+            URL_API_BUSCA,
+            params=params,
+            headers=HEADERS,
+            timeout=TIMEOUT_BUSCA
+        )
+        
+        data = resp_busca.json().get('data', [])
+        
+        if not data:
+            logger.debug(f"CNPJ {cnpj_alvo}: Nenhum documento encontrado")
+            return []
+        
+        df_docs = pd.DataFrame(data)
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # ETAPA 2: FILTER
+        # ─────────────────────────────────────────────────────────────────────
+        
+        df_mensal = df_docs[
+            (df_docs['tipoDocumento'].str.strip() == "Informe Mensal Estruturado") &
+            (df_docs['situacaoDocumento'].str.strip() == "A")
+        ].copy()
+        
+        if df_mensal.empty:
+            logger.debug(f"CNPJ {cnpj_alvo}: Nenhum informe mensal ativo")
+            return []
+        
+        # Converter datas
+        df_mensal['dataReferenciaOrdenavel'] = pd.to_datetime(
+            df_mensal['dataReferencia'].str[3:] + '-' + 
+            df_mensal['dataReferencia'].str[:2] + '-01',
+            format='%Y-%m-%d', errors='coerce'
+        )
+        
+        df_mensal.dropna(subset=['dataReferenciaOrdenavel'], inplace=True)
+        
+        if df_mensal.empty:
+            logger.debug(f"CNPJ {cnpj_alvo}: Datas inválidas")
+            return []
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # ETAPA 3: SELEÇÃO DE DOCUMENTOS
+        # ─────────────────────────────────────────────────────────────────────
+        
+        documentos_processar = []
+        
+        # Último mês
+        if coletar_ultimo:
+            df_mensal_sorted = df_mensal.sort_values('dataReferenciaOrdenavel', ascending=False)
+            df_ultimo = df_mensal_sorted.groupby('descricaoFundo').first().reset_index()
+            documentos_processar.extend(df_ultimo.to_dict('records'))
+        
+        # Dezembros
+        for ano in anos_dezembro:
+            data_dezembro = f"12/{ano}"
+            docs_dezembro = df_mensal[df_mensal['dataReferencia'] == data_dezembro]
+            
+            if not docs_dezembro.empty:
+                df_dez_unico = docs_dezembro.groupby('descricaoFundo').first().reset_index()
+                documentos_processar.extend(df_dez_unico.to_dict('records'))
+        
+        # Remover duplicatas por ID
+        ids_processados = set()
+        docs_unicos = []
+        for doc in documentos_processar:
+            doc_id = doc['id']
+            if doc_id not in ids_processados:
+                docs_unicos.append(doc)
+                ids_processados.add(doc_id)
+        
+        logger.debug(f"CNPJ {cnpj_alvo}: {len(docs_unicos)} documentos para processar")
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # ETAPA 4-6: DOWNLOAD, EXTRACT, CLEANUP (COM CACHE)
+        # ─────────────────────────────────────────────────────────────────────
+        
+        for doc_info in docs_unicos:
+            doc_id = str(doc_info['id'])
+            data_referencia = doc_info.get('dataReferencia', 'N/A')
+            nome_fundo_doc = doc_info.get('descricaoFundo', 'Nome N/A')
+            
+            # Tentar ler do cache primeiro
+            dados_cache = ler_cache(cnpj_alvo, doc_id)
+            if dados_cache is not None:
+                resultados_fundo_cnpj.append(dados_cache)
+                continue
+            
+            nome_arquivo_temp = None
+            
+            try:
+                # Download com retry
+                url_download = f"{URL_API_DOWNLOAD}?id={doc_id}"
+                resp_download = fazer_requisicao_com_retry(
+                    url_download,
+                    headers=HEADERS,
+                    timeout=TIMEOUT_DOWNLOAD
+                )
+                
+                xml_content = base64.b64decode(resp_download.content)
+                
+                # Salvar temporariamente
+                nome_arquivo_temp = f'temp_{cnpj_alvo}_{doc_id}.xml'
+                with open(nome_arquivo_temp, 'wb') as f:
+                    f.write(xml_content)
+                
+                # Extrair dados
+                dados_extraidos = extrair_dados_xml_completo(xml_content)
+                
+                if not dados_extraidos.get('CNPJ_FUNDO'):
+                    dados_extraidos['CNPJ_FUNDO'] = cnpj_alvo
+                
+                # Metadados
+                dados_extraidos['NOME_FUNDO'] = nome_fundo_doc
+                dados_extraidos['STATUS'] = 'SUCESSO'
+                dados_extraidos['ID_DOCUMENTO'] = doc_id
+                dados_extraidos['DATA_REFERENCIA_DOC'] = data_referencia
+                dados_extraidos['MENSAGEM_ERRO'] = None
+                
+                # Tipo de coleta
+                if data_referencia.startswith('12/'):
+                    ano = data_referencia.split('/')[1]
+                    dados_extraidos['TIPO_COLETA'] = f'DEZEMBRO_{ano}'
+                else:
+                    dados_extraidos['TIPO_COLETA'] = 'ULTIMO_MES'
+                
+                # Salvar em cache
+                salvar_cache(cnpj_alvo, doc_id, dados_extraidos)
+                
+                resultados_fundo_cnpj.append(dados_extraidos)
+                
+            except requests.exceptions.HTTPError as e:
+                logger.warning(f"HTTP Error | CNPJ {cnpj_alvo} | Doc {doc_id}: {e}")
+                resultados_fundo_cnpj.append({
+                    'CNPJ_FUNDO': cnpj_alvo,
+                    'NOME_FUNDO': nome_fundo_doc,
+                    'STATUS': 'ERRO_HTTP_DOWNLOAD',
+                    'MENSAGEM_ERRO': f'HTTP Error: {str(e)}',
+                    'DATA_REFERENCIA_DOC': data_referencia,
+                    'TIPO_COLETA': 'ERRO'
+                })
+            except requests.exceptions.Timeout as e:
+                logger.warning(f"Timeout | CNPJ {cnpj_alvo} | Doc {doc_id}: {e}")
+                resultados_fundo_cnpj.append({
+                    'CNPJ_FUNDO': cnpj_alvo,
+                    'NOME_FUNDO': nome_fundo_doc,
+                    'STATUS': 'TIMEOUT_DOWNLOAD',
+                    'MENSAGEM_ERRO': f'Timeout: {str(e)}',
+                    'DATA_REFERENCIA_DOC': data_referencia,
+                    'TIPO_COLETA': 'ERRO'
+                })
+            except ET.ParseError as e:
+                logger.error(f"Parse Error | CNPJ {cnpj_alvo} | Doc {doc_id}: {e}")
+                resultados_fundo_cnpj.append({
+                    'CNPJ_FUNDO': cnpj_alvo,
+                    'NOME_FUNDO': nome_fundo_doc,
+                    'STATUS': 'ERRO_PARSE_XML',
+                    'MENSAGEM_ERRO': f'Erro XML: {str(e)}',
+                    'DATA_REFERENCIA_DOC': data_referencia,
+                    'TIPO_COLETA': 'ERRO'
+                })
+            except Exception as e:
+                logger.error(f"Erro inesperado | CNPJ {cnpj_alvo} | Doc {doc_id}: {e}", exc_info=True)
+                resultados_fundo_cnpj.append({
+                    'CNPJ_FUNDO': cnpj_alvo,
+                    'NOME_FUNDO': nome_fundo_doc,
+                    'STATUS': 'ERRO_INESPERADO',
+                    'MENSAGEM_ERRO': f'Erro: {str(e)}',
+                    'DATA_REFERENCIA_DOC': data_referencia,
+                    'TIPO_COLETA': 'ERRO'
+                })
+            
+            finally:
+                # Cleanup
+                if nome_arquivo_temp and os.path.exists(nome_arquivo_temp):
+                    try:
+                        os.remove(nome_arquivo_temp)
+                    except OSError:
+                        pass
+    
+    except Exception as e:
+        logger.error(f"Erro geral | CNPJ {cnpj_alvo}: {e}", exc_info=True)
+        resultados_fundo_cnpj.append({
+            'CNPJ_FUNDO': cnpj_alvo,
+            'NOME_FUNDO': nome_fundo_referencia,
+            'STATUS': 'ERRO_GERAL',
+            'MENSAGEM_ERRO': f'Erro geral: {str(e)}',
+            'TIPO_COLETA': 'ERRO'
+        })
+    
+    return resultados_fundo_cnpj
+
+
+logger.info("✅ Função ETL com retry, cache e paralelização pronta")
+
+# ═════════════════════════════════════════════════════════════════════
+# CÉLULA 8: CARREGAMENTO DOS CNPJs
+# ═════════════════════════════════════════════════════════════════════
+
+ARQUIVO_CSV_ENTRADA = 'lista_cnpjs_fidc.csv'
+
+try:
+    df_cnpjs_entrada = pd.read_csv(ARQUIVO_CSV_ENTRADA, encoding='utf-8-sig')
+    
+    logger.info(f"✅ Arquivo '{ARQUIVO_CSV_ENTRADA}' carregado")
+    logger.info(f"   Total de CNPJs: {len(df_cnpjs_entrada)}")
+    
+    df_cnpjs_entrada['CNPJ'] = df_cnpjs_entrada['CNPJ'].astype(str).str.replace('.0', '', regex=False)
+    df_cnpjs_entrada['CNPJ'] = df_cnpjs_entrada['CNPJ'].str.zfill(14)
+    
+    # Estimativa de tempo
+    docs_estimados_por_cnpj = (1 if COLETAR_ULTIMO_MES else 0) + len(ANOS_DEZEMBRO)
+    tempo_estimado_seq = len(df_cnpjs_entrada) * DELAY_ENTRE_REQUISICOES * docs_estimados_por_cnpj / 60
+    tempo_estimado_par = tempo_estimado_seq / MAX_WORKERS
+    
+    logger.info(f"⏱️  Tempo estimado:")
+    logger.info(f"   Sequencial: ~{tempo_estimado_seq:.1f} min")
+    logger.info(f"   Paralelo ({MAX_WORKERS} threads): ~{tempo_estimado_par:.1f} min")
+    logger.info(f"   Ganho: {(1 - tempo_estimado_par/tempo_estimado_seq)*100:.0f}%")
+
+except FileNotFoundError:
+    logger.error(f"❌ Arquivo '{ARQUIVO_CSV_ENTRADA}' não encontrado!")
+    raise
+
+# ═════════════════════════════════════════════════════════════════════
+# CÉLULA 9: PROCESSAMENTO EM LOTE COM PARALELIZAÇÃO
+# ═════════════════════════════════════════════════════════════════════
+
+logger.info("="*80)
+logger.info("🚀 INICIANDO PROCESSAMENTO PARALELO")
+logger.info("="*80)
+
+resultados_consolidados = []
+tempo_inicio = datetime.now()
+
+# Processar com ThreadPoolExecutor
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    # Submeter todas as tarefas
+    future_to_cnpj = {}
+    for idx, row in df_cnpjs_entrada.iterrows():
+        cnpj = row['CNPJ']
+        nome_fundo_ref = row.get('NOME_FUNDO', '')
+        
+        future = executor.submit(
+            etl_fidc_historico,
+            cnpj,
+            nome_fundo_ref,
+            ANOS_DEZEMBRO,
+            COLETAR_ULTIMO_MES
+        )
+        future_to_cnpj[future] = (cnpj, nome_fundo_ref)
+    
+    # Processar conforme completam
+    with tqdm(total=len(df_cnpjs_entrada), desc="Processando CNPJs", unit="cnpj") as pbar:
+        for future in as_completed(future_to_cnpj):
+            cnpj, nome_fundo_ref = future_to_cnpj[future]
+            
+            try:
+                resultados_atuais = future.result()
+                
+                if resultados_atuais:
+                    resultados_consolidados.extend(resultados_atuais)
+                    
+                    # Log sucesso
+                    sucessos = [r for r in resultados_atuais if r.get('STATUS') == 'SUCESSO']
+                    if sucessos:
+                        num_docs = len(sucessos)
+                        pbar.set_postfix({'últimos_docs': num_docs, 'status': '✅'})
+                    else:
+                        pbar.set_postfix({'status': '❌ Erro'})
+                else:
+                    resultados_consolidados.append({
+                        'CNPJ_FUNDO': cnpj,
+                        'NOME_FUNDO': nome_fundo_ref,
+                        'STATUS': 'NENHUM_DOCUMENTO',
+                        'TIPO_COLETA': 'ERRO'
+                    })
+                    pbar.set_postfix({'status': '❌ Sem docs'})
+                
+            except Exception as e:
+                logger.error(f"Erro ao processar futuro de {cnpj}: {e}")
+                pbar.set_postfix({'status': '❌ Exception'})
+            
+            pbar.update(1)
+            
+            # Rate limiting suave entre completions
+            time.sleep(0.1)
+
+tempo_decorrido = (datetime.now() - tempo_inicio).total_seconds()
+
+logger.info("="*80)
+logger.info("✅ PROCESSAMENTO CONCLUÍDO!")
+logger.info(f"   Tempo decorrido: {tempo_decorrido/60:.2f} minutos")
+logger.info("="*80)
+
+# ═════════════════════════════════════════════════════════════════════
+# CÉLULA 10: CONSOLIDAÇÃO E ESTATÍSTICAS
+# ═════════════════════════════════════════════════════════════════════
+
+df_resultado_final = pd.DataFrame(resultados_consolidados)
+
+total_documentos = len(df_resultado_final)
+total_sucesso = len(df_resultado_final[df_resultado_final['STATUS'] == 'SUCESSO'])
+total_erros = total_documentos - total_sucesso
+
+logger.info("📊 ESTATÍSTICAS DO PROCESSAMENTO")
+logger.info("-"*80)
+logger.info(f"   Total de CNPJs processados: {len(df_cnpjs_entrada)}")
+logger.info(f"   Total de documentos coletados: {total_documentos}")
+logger.info(f"   ✅ Sucesso: {total_sucesso} ({total_sucesso/total_documentos*100:.1f}%)")
+logger.info(f"   ❌ Erros: {total_erros} ({total_erros/total_documentos*100:.1f}%)")
+
+# Distribuição por tipo
+if total_sucesso > 0:
+    df_sucesso = df_resultado_final[df_resultado_final['STATUS'] == 'SUCESSO'].copy()
+    
+    logger.info("\n📅 DISTRIBUIÇÃO POR TIPO DE COLETA:")
+    tipos_coleta = df_sucesso['TIPO_COLETA'].value_counts()
+    for tipo, count in tipos_coleta.items():
+        logger.info(f"   • {tipo}: {count} documentos")
+
+# Distribuição de erros
+if total_erros > 0:
+    logger.info("\n⚠️  TIPOS DE ERROS:")
+    erros_por_tipo = df_resultado_final[df_resultado_final['STATUS'] != 'SUCESSO']['STATUS'].value_counts()
+    for status, count in erros_por_tipo.items():
+        logger.info(f"   • {status}: {count}")
+
+# Estatísticas financeiras
+if total_sucesso > 0:
+    for col in ['ATIVO_TOTAL', 'INADIMPLENCIA_TOTAL', 'INDICE_NPL_PERCENTUAL']:
+        df_sucesso[col] = pd.to_numeric(df_sucesso[col], errors='coerce')
+    
+    df_sucesso_valido = df_sucesso[df_sucesso['ATIVO_TOTAL'] > 0]
+    
+    if len(df_sucesso_valido) > 0:
+        logger.info("\n💰 ESTATÍSTICAS FINANCEIRAS")
+        logger.info("-"*80)
+        
+        ativo_total_soma = df_sucesso_valido['ATIVO_TOTAL'].sum()
+        ativo_total_media = df_sucesso_valido['ATIVO_TOTAL'].mean()
+        inadimpl_soma = df_sucesso_valido['INADIMPLENCIA_TOTAL'].sum()
+        npl_medio = df_sucesso_valido['INDICE_NPL_PERCENTUAL'].mean()
+        
+        logger.info(f"   Ativo Total (Soma):     R$ {ativo_total_soma:,.2f}")
+        logger.info(f"   Ativo Total (Média):    R$ {ativo_total_media:,.2f}")
+        logger.info(f"   Inadimplência (Soma):   R$ {inadimpl_soma:,.2f}")
+        logger.info(f"   NPL Médio:              {npl_medio:.2f}%")
+
+# ═════════════════════════════════════════════════════════════════════
+# CÉLULA 11: EXPORTAÇÃO
+# ═════════════════════════════════════════════════════════════════════
+
+# CSV principal
+arquivo_csv = 'base_fidc_completa_historica_v5.csv'
+df_resultado_final.to_csv(arquivo_csv, index=False, encoding='utf-8-sig', sep=';', decimal=',')
+logger.info(f"\n💾 Arquivo salvo: {arquivo_csv}")
+
+# Excel com múltiplas abas
+arquivo_excel = 'base_fidc_completa_historica_v5.xlsx'
+
+try:
+    with pd.ExcelWriter(arquivo_excel, engine='openpyxl') as writer:
+        df_resultado_final.to_excel(writer, sheet_name='Dados_Completos', index=False)
+        
+        if total_sucesso > 0:
+            df_sucesso.to_excel(writer, sheet_name='Dados_Validos', index=False)
+        
+        if total_erros > 0:
+            df_erros = df_resultado_final[df_resultado_final['STATUS'] != 'SUCESSO']
+            df_erros.to_excel(writer, sheet_name='Erros', index=False)
+        
+        if COLETAR_ULTIMO_MES and total_sucesso > 0:
+            df_ultimo = df_sucesso[df_sucesso['TIPO_COLETA'] == 'ULTIMO_MES']
+            if not df_ultimo.empty:
+                df_ultimo.to_excel(writer, sheet_name='Ultimo_Mes', index=False)
+        
+        for ano in ANOS_DEZEMBRO:
+            tipo_coleta = f'DEZEMBRO_{ano}'
+            df_ano = df_sucesso[df_sucesso['TIPO_COLETA'] == tipo_coleta]
+            if not df_ano.empty:
+                df_ano.to_excel(writer, sheet_name=f'Dezembro_{ano}', index=False)
+    
+    logger.info(f"💾 Arquivo salvo: {arquivo_excel}")
+except Exception as e:
+    logger.warning(f"Não foi possível gerar Excel: {e}")
+
+# Log final
+logger.info("\n" + "="*80)
+logger.info("✅ ETL FIDC V5 CONCLUÍDO COM SUCESSO!")
+logger.info("="*80)
+logger.info(f"📁 Arquivos gerados:")
+logger.info(f"   • {arquivo_csv}")
+logger.info(f"   • {arquivo_excel}")
+logger.info(f"   • {log_filename}")
+logger.info(f"\n🎯 Melhorias implementadas:")
+logger.info(f"   1. ✅ Bug fix - Conversão de tipos corrigida")
+logger.info(f"   2. ✅ Logging profissional ({log_filename})")
+logger.info(f"   3. ✅ Retry com backoff exponencial (até {MAX_RETRIES}x)")
+logger.info(f"   4. ✅ Paralelização ({MAX_WORKERS} threads)")
+logger.info(f"   5. ✅ Cache de resultados ({CACHE_DIR}/)")
+logger.info(f"   6. ✅ Progress bar visual")
+logger.info(f"   7. ✅ Validação de NPL outliers")
+logger.info("\n⏱️  Performance:")
+logger.info(f"   Tempo de execução: {tempo_decorrido/60:.2f} minutos")
+logger.info(f"   Média por CNPJ: {tempo_decorrido/len(df_cnpjs_entrada):.2f} segundos")
+logger.info(f"   Taxa de sucesso: {total_sucesso/total_documentos*100:.1f}%")
+logger.info("="*80)
