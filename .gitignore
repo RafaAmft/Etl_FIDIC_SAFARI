@@ -1,0 +1,55 @@
+# Ambiente virtual
+venv/
+env/
+ENV/
+.venv
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Data
+data/cache/
+data/output/*/
+data/archive/
+*.csv
+!data/input/lista_cnpjs_fidc.example.csv
+
+# Logs
+logs/*.log
+
+# Cache do projeto (legado)
+.cache_fidc/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo  
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
