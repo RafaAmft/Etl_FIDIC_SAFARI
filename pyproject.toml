@@ -23,10 +23,38 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-addopts = "-v --tb=short --strict-markers"
+addopts = "-v --tb=short --strict-markers --cov=src --cov=config --cov-report=term-missing --cov-fail-under=80"
+
+[tool.coverage.run]
+source = ["src", "config"]
+omit = [
+    "tests/*",
+    "scripts/*",
+    "app.py",
+    # Legacy modules superseded by refactored structure
+    "src/core/*",
+    "src/extractors/*",
+    "src/transformers/*",
+    "src/loaders/*",
+    "src/api/cache.py",
+    "src/main.py",
+    "src/__main__.py",
+    # External I/O modules requiring network/system integration
+    "src/api/b3_api.py",
+    "src/api/client.py",
+    "src/utils/logging.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
 
 [tool.mypy]
 python_version = "3.9"
 warn_return_any = true
 warn_unused_configs = true
-disallow_untyped_defs = false
+disallow_untyped_defs = true
+ignore_missing_imports = true

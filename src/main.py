@@ -14,15 +14,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 from dateutil.relativedelta import relativedelta
 
-from src.core.config import etl_config, api_config, paths_config
-from src.core.logging_config import setup_logging
+from config.settings import settings
+from src.utils.logging import setup_logging
 from src.api.b3_api import B3API
-from src.api.cache import CacheManager
-from src.extractors.field_extractor import FieldExtractor
-from src.transformers.metrics_calculator import MetricsCalculator
-from src.transformers.anomaly_detector import AnomalyDetector
-from src.transformers.safari_scorer import SafariScorer
-from src.loaders.csv_exporter import CSVExporter
+from src.persistence.cache import CacheManager
+from src.extraction.field_extractor import FieldExtractor
+from src.transformation.metrics_calculator import MetricsCalculator
+from src.transformation.anomaly_detector import AnomalyDetector
+from src.transformation.safari_scorer import SafariScorer
+from src.persistence.csv_exporter import CSVExporter
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +137,7 @@ def pipeline_por_cnpj(
         # ETAPA 3: ROLLING WINDOW (últimos N meses)
         # ═══════════════════════════════════════════════════════════════
         data_limite = datetime.now() - relativedelta(
-            months=etl_config.rolling_window_months
+            months=settings.etl_rolling_window_months
         )
         df_mensal = df_mensal[
             df_mensal['dataReferenciaOrdenavel'] >= data_limite
@@ -146,7 +146,7 @@ def pipeline_por_cnpj(
         if df_mensal.empty:
             logger.debug(
                 f"CNPJ {cnpj}: Nenhum doc nos últimos "
-                f"{etl_config.rolling_window_months} meses"
+                f"{settings.etl_rolling_window_months} meses"
             )
             return resultados
 
@@ -251,7 +251,7 @@ def pipeline_por_cnpj(
             resultados.append(dados)
 
             # Rate limiting
-            time.sleep(api_config.delay_entre_requisicoes)
+            time.sleep(settings.b3_delay_requisicoes)
 
     except Exception as e:
         logger.error(f"Erro geral CNPJ {cnpj}: {e}", exc_info=True)
@@ -318,7 +318,7 @@ def main():
     
     # 1. Setup de logging
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = paths_config.logs_dir / f"etl_fidc_{timestamp}.log"
+    log_file = settings.logs_dir / f"etl_fidc_{timestamp}.log"
     setup_logging(log_file)
     
     logger.info("=" * 80)
@@ -332,22 +332,22 @@ def main():
         extractor = FieldExtractor()
         
         logger.info(f"⚙️ Configurações:")
-        logger.info(f"   • Rolling window: {etl_config.rolling_window_months} meses")
-        logger.info(f"   • Max workers: {etl_config.max_workers}")
-        logger.info(f"   • Delay entre requisições: {api_config.delay_entre_requisicoes}s")
-        logger.info(f"   • Cache: {'Habilitado' if etl_config.cache_enabled else 'Desabilitado'}")
-        logger.info(f"   • Cache version: {etl_config.cache_version}")
+        logger.info(f"   • Rolling window: {settings.etl_rolling_window_months} meses")
+        logger.info(f"   • Max workers: {settings.etl_max_workers}")
+        logger.info(f"   • Delay entre requisições: {settings.b3_delay_requisicoes}s")
+        logger.info(f"   • Cache: {'Habilitado' if settings.etl_cache_enabled else 'Desabilitado'}")
+        logger.info(f"   • Cache version: {settings.etl_cache_version}")
         logger.info("=" * 80)
         
         # 3. Carregar lista de CNPJs
-        input_file = paths_config.get_input_file()
+        input_file = settings.get_input_file()
         df_cnpjs = carregar_cnpjs(input_file)
         
         # Estimativa de tempo
         docs_estimados = 40  # Média de meses com dados por CNPJ
-        tempo_seq = len(df_cnpjs) * api_config.delay_entre_requisicoes * docs_estimados / 60
-        tempo_par = tempo_seq / etl_config.max_workers
-        logger.info(f"⏱️ Tempo estimado: ~{tempo_par:.1f} min ({etl_config.max_workers} threads)")
+        tempo_seq = len(df_cnpjs) * settings.b3_delay_requisicoes * docs_estimados / 60
+        tempo_par = tempo_seq / settings.etl_max_workers
+        logger.info(f"⏱️ Tempo estimado: ~{tempo_par:.1f} min ({settings.etl_max_workers} threads)")
         
         # 4. Processar CNPJs com ThreadPoolExecutor
         logger.info("=" * 80)
@@ -357,7 +357,7 @@ def main():
         tempo_inicio = datetime.now()
         todos_resultados = []
 
-        with ThreadPoolExecutor(max_workers=etl_config.max_workers) as executor:
+        with ThreadPoolExecutor(max_workers=settings.etl_max_workers) as executor:
             future_to_cnpj = {}
             for _, row in df_cnpjs.iterrows():
                 future = executor.submit(
@@ -407,7 +407,7 @@ def main():
         exporter.export_monitor_completo(todos_resultados, timestamp)
         exporter.export_distressed_npl(todos_resultados, 20.0, timestamp)
         exporter.export_safari_oportunidades(
-            todos_resultados, etl_config.score_min, timestamp
+            todos_resultados, settings.etl_score_min, timestamp
         )
         
         # 7. Estatísticas finais
