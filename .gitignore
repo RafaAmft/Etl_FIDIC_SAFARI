@@ -28,6 +28,9 @@ logs/*.log
 # Cache do projeto (legado)
 .cache_fidc/
 
+# Claude Code
+.claude/
+
 # IDEs
 .vscode/
 .idea/

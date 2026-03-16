@@ -55,11 +55,11 @@ class B3API:
             )
             documentos: List[Dict[str, Any]] = response.json().get("data", [])
 
-            # Filtro local por tipo de documento
+            # Filtro local por tipo de documento (strip para remover espaços da B3)
             if tipo_documento:
                 documentos = [
                     d for d in documentos
-                    if d.get("tipoDocumento", "") == tipo_documento
+                    if d.get("tipoDocumento", "").strip() == tipo_documento
                 ]
 
             logger.debug(f"CNPJ {cnpj}: {len(documentos)} documentos encontrados")
