@@ -1,1 +1,3 @@
-"""Extractors do pacote."""
+"""
+Extractors package
+"""

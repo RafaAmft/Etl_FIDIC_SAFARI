@@ -1,1 +1,3 @@
-"""Loaders do pacote."""
+"""
+Loaders package
+"""

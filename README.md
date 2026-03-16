@@ -1,155 +1,130 @@
-# ETL FIDC - Extração de Dados de Fundos FIDC
+# FIDC ETL - Monitor de Fundos Distressed
 
-Sistema modular de ETL para extração, transformação e validação de dados de Fundos de Investimento em Direitos Creditórios (FIDC) da B3.
+> Sistema ETL para coleta, análise e monitoramento de Fundos de Investimento em Direitos Creditórios (FIDCs) com foco em identificação de oportunidades de distressed assets.
 
-## 🎯 Características
+## ✨ Funcionalidades Principais
 
-- ✅ **90+ campos extraídos** de XMLs da API B3
-- ✅ **5 validações de QA** automatizadas
-- ✅ **Indicadores financeiros** calculados (NPL, Liquidez, Concentração)
-- ✅ **Relatórios automáticos** (CSV/Excel)
-- ✅ **Comparação de versões** de dados
-- ✅ **Logging estruturado** para auditoria
+- ✅ **Coleta automatizada** de dados da B3 (rolling 60 meses)
+- ✅ **Extração de 100+ campos** por fundo
+- ✅ **Cálculo de métricas** de distress (NPL, Liquidez, Zumbi Ratio)
+- ✅ **Sistema de scoring** FIDC Safari
+- ✅ **Detecção automática** de anomalias estruturais
+- ✅ **Cache inteligente** com versionamento
 - ✅ **Arquitetura modular** e testável
 
-## 📁 Estrutura do Projeto
-
-```
-.
-├── src/                      # Código fonte principal
-│   ├── config/              # Configurações (API, paths, etc)
-│   ├── models/              # Modelos de dados (FIDCData, Flags)
-│   ├── extractors/          # API B3 + XML Parser v1.0.2
-│   ├── transformers/        # Limpeza e cálculo de indicadores
-│   ├── validators/          # Validações QA + Diff Generator
-│   ├── loaders/             # Exportação CSV/Excel
-│   ├── services/            # Orquestração (ETL + QA)
-│   └── utils/               # Logging e utilitários
-├── scripts/                  # Scripts CLI
-│   ├── run_etl.py           # ⭐ Script principal
-│   └── compare_versions.py  # Comparação de versões
-├── data/                     # Dados de entrada
-├── outputs/                  # Resultados gerados
-└── notebooks/                # Notebooks originais
-
-## 🚀 Instalação
+## 📦 Instalação
 
 ```bash
-# Clonar repositório
-cd "c:\Projetos\Proejto FIDIC SAFARI"
+# 1. Clonar repositório
+git clone <repo-url>
+cd Etl_Fidic
 
-# Instalar dependências
+# 2. Criar ambiente virtual
+python -m venv venv
+venv\Scripts\activate  # Windows
+# source venv/bin/activate  # Linux/Mac
+
+# 3. Instalar dependências
 pip install -r requirements.txt
+
+# 4. (Opcional) Instalar dependências de desenvolvimento
+pip install -r requirements-dev.txt
 ```
 
-## 📊 Uso
+## 🚀 Uso
 
-### 1. Executar ETL Completo
+### Executar ETL Completo
 
 ```bash
-python scripts/run_etl.py
+# Via módulo (recomendado)
+python -m src
+
+# Via script wrapper
+python scripts\run_etl.py
 ```
 
-**O que faz:**
-1. Carrega CNPJs de `data/lista_cnpjs_fidc.csv`
-2. Busca e baixa XMLs da API B3
-3. Extrai 90+ campos financeiros
-4. Calcula indicadores (NPL, Liquidez)
-5. Aplica 5 validações de QA
-6. Gera relatórios em `outputs/`
-
-**Saídas geradas:**
-- `outputs/cleaned_snapshot.csv` - Dados completos validados
-- `outputs/qa_issues.csv` - Registros com problemas
-- `outputs/etl_fidc.log` - Log detalhado
-
-### 2. Comparar Versões
+### Limpar Cache
 
 ```bash
-python scripts/compare_versions.py outputs/snapshot1.csv outputs/snapshot2.csv
+python scripts\clear_cache.py
 ```
 
-Gera: `outputs/diff_v1_v2.csv` com diferenças numéricas
+## 📊 Estrutura dos Outputs
 
-### 3. Analisar Qualidade dos Dados
+```
+data/output/2025-12-26/
+├── fidc_monitor_completo_20251226_235900.csv      # Todos os fundos
+├── fidc_safari_oportunidades_20251226_235900.csv  # Score >= 30
+└── fidc_distressed_npl_gt_20_20251226_235900.csv  # NPL >= 20%
+```
+
+## 📈 Métricas Calculadas
+
+### NPL Ratio (Non-Performing Loans)
+```
+NPL = (Créditos Vencidos Inadimplentes / Carteira Total) × 100
+```
+
+**Classificação:**
+- 0-5%: Saudável
+- 5-15%: Atenção
+- 15-50%: Distressed
+- 50-100%: Severo
+- \>100%: Crítico (anomalia estrutural)
+
+### FIDC Safari Score (0-100)
+
+**Componentes:**
+- **NPL (40%)**: Maior NPL = maior oportunidade
+- **Zumbi Ratio (25%)**: Créditos > 3 anos vencidos
+- **Liquidez (25%)**: Menor liquidez = maior pressão
+- **Porte (10%)**: Ativo total do fundo
+
+**Classificação:**
+- 70-100: Alta oportunidade
+- 50-70: Oportunidade moderada
+- 30-50: Monitorar
+- <30: Sem oportunidade
+
+## 🏗️ Arquitetura
+
+```
+src/
+├── core/           # Configurações e logging
+├── api/            # Cliente B3 e cache
+├── extractors/     # Extração de XML
+├── transformers/   # Métricas e scoring
+├── loaders/        # Export de dados
+└── main.py         # Pipeline principal
+```
+
+## 🧪 Testes
 
 ```bash
-python scripts/analyze_data_quality.py
+# Rodar todos os testes
+pytest
+
+# Com cobertura
+pytest --cov=src --cov-report=html
 ```
 
-**O que faz:**
-1. Analisa estatísticas gerais (sucesso, erros, completude)
-2. Avalia flags de QA (quantos registros com cada problema)
-3. Calcula estatísticas de indicadores financeiros (NPL, Liquidez, Ativo)
-4. Detecta outliers (NPL alto, ativos extremos)
-5. Lista top fundos por NPL
+## ⚙️ Configuração
 
-**Saída gerada:**
-- `outputs/data_quality_report.txt` - Relatório completo de qualidade
-
-## 📈 Validações de QA
-
-O sistema aplica 5 flags de validação automaticamente:
-
-| Flag | Descrição |
-|------|-----------|
-| `ATIVO_ZERO_FLAG` | Ativo Total = 0 |
-| `DIVERGE_LIQ_FLAG` | Divergência entre liquidez calc. e informada |
-| `CARTEIRA_BRUTA_ZERO_COM_INAD_FLAG` | Carteira vazia com inadimplência |
-| `DIVERGE_NPL_FLAG` | Divergência entre NPL calc. e informado |
-| `SEM_POSICAO_FLAG` | Sem posição de crédito mas com ativo |
-
-## 🔧 Uso Programático
-
-```python
-from src.services.etl_service import FIDCETLService
-from src.services.qa_service import QAService
-
-# ETL
-etl = FIDCETLService()
-df = etl.process_and_validate(['51199121000145', '47388724000118'])
-
-# QA
-qa = QAService()
-results = qa.full_qa_pipeline(df, output_dir='outputs')
-```
-
-## 📝 Formato de Entrada
-
-O arquivo `data/lista_cnpjs_fidc.csv` deve conter:
-
-```csv
-CNPJ,NOME_FUNDO,CNPJ_ORIGINAL
-51199121000145,2MONEY RESP LIMITADA FIDC NP SUBORDINADA JÚNIOR 1,51.199.121/0001-45
-47388724000118,3R RESP LIMITADA FIDC NP ÚNICA 1,47.388.724/0001-18
-```
-
-## 🧪 Desenvolvimento
-
-```bash
-# Formatar código
-black src/ scripts/
-
-# Verificar estilo
-flake8 src/ scripts/
-
-# Executar testes (quando disponíveis)
-pytest tests/
-```
+Edite `src/core/config.py` para ajustar:
+- Rolling window (padrão: 60 meses)
+- Thresholds de filtros (NPL, Score)
+- Cache (habilitar/desabilitar)
+- Timeouts e retry
 
 ## 📄 Licença
 
-Projeto interno - Rafael Augusto © 2026
+MIT License
 
 ## 🤝 Contribuindo
 
-Para contribuir:
-1. Mantenha a estrutura modular
-2. Documente todas as funções
-3. Use type hints
-4. Adicione testes unitários
-5. Atualize este README
+Pull requests são bem-vindos! Para mudanças maiores, abra uma issue primeiro.
 
-## 📞 Suporte
+---
 
-Ver documentação em `docs/` para detalhes técnicos.
+**Versão:** 8.0.0 (Refatorado + Otimizado)  
+**Última atualização:** 2026-03-12

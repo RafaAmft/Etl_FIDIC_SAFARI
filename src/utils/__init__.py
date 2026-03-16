@@ -1,1 +1,1 @@
-"""Utils do pacote."""
+"""Utilitários do projeto FIDC ETL."""
