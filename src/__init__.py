@@ -1,4 +1,4 @@
-"""Pacote principal do ETL FIDC."""
-
-__version__ = "1.0.0"
-__author__ = "Rafael Augusto"
+"""
+FIDC ETL - Core Package
+"""
+__version__ = "8.0.0"
